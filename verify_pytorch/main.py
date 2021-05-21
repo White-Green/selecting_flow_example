@@ -10,7 +10,6 @@ def load_file_as_tensor_list(str__file_path):
         int__len, int__tensor_size = map(int, f.readline().split())
         list_ndarray_float__result = []
         for _ in range(int__len):
-            # sparse_tensor_float__tensor = torch.sparse_coo_tensor(size=(int__tensor_size,), dtype=torch.float32)
             list_tuple2_str_str__sparse_tensor = map(lambda str_index_and_value: tuple(str_index_and_value.split(':')),
                                                      f.readline().split())
             list_int__indexes = []
@@ -19,14 +18,10 @@ def load_file_as_tensor_list(str__file_path):
                 list_int__indexes.append(int(tuple2_str_str__index_and_value[0]))
                 list_float__values.append(float(tuple2_str_str__index_and_value[1]))
 
-                # int__index = int(tuple2_str_str__index_and_value[0])
-                # float__value = float(tuple2_str_str__index_and_value[1])
-                # sparse_tensor_float__tensor[int__index] = float__value
             sparse_tensor_float__tensor = torch.sparse.FloatTensor(
                 torch.LongTensor([[0] * len(list_int__indexes), list_int__indexes]),
                 torch.FloatTensor(list_float__values),
                 torch.Size([1, int__tensor_size]))
-            # print(sparse_tensor_float__tensor)
             list_ndarray_float__result.append(sparse_tensor_float__tensor)
         return list_ndarray_float__result
 
