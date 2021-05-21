@@ -12,10 +12,12 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use selecting_flow::compute_graph::activation::rectified_linear::ReLU;
 use selecting_flow::compute_graph::activation::softmax_with_loss::SoftmaxWithLoss;
-use selecting_flow::compute_graph::fully_connected_layer::FullyConnectedLayer;
+use selecting_flow::compute_graph::fully_connected_layer::{ApplyFullyConnectedLayer, FullyConnectedLayer};
 use selecting_flow::compute_graph::input_box::InputBox;
+use selecting_flow::compute_graph::{ExactDimensionComputeGraphNode, GraphNode};
 use selecting_flow::data_types::{Sparse, TensorEitherOwned};
 use selecting_flow::hasher::sim_hash::SimHash;
+use selecting_flow::hasher::FullyConnectedHasher;
 use selecting_flow::optimizer::adam::Adam;
 
 fn main() {
@@ -58,7 +60,7 @@ fn train(train_data: TrainData) {
     dbg!(parallel_num);
     eprintln!("start training");
     let time = Instant::now();
-    let mini_batch_count = data_pair_train.len() / MINI_BATCH_SIZE;
+    let mini_batch_count = (data_pair_train.len() + MINI_BATCH_SIZE - 1) / MINI_BATCH_SIZE;
     dbg!(data_pair_train.len());
     dbg!(mini_batch_count);
     println!("log_type,iteration,time_ms,accuracy,loss");
@@ -67,59 +69,19 @@ fn train(train_data: TrainData) {
         for i in 0..mini_batch_count {
             dbg!(e);
             dbg!(i);
-            let batch_range = i * data_pair_train.len() / mini_batch_count..(i + 1) * data_pair_train.len() / mini_batch_count;
-            let data_pair = &data_pair_train[batch_range.clone()];
-            let (sum_of_loss, sum_of_accuracy) = crossbeam::scope(|scope| {
-                let mut threads = Vec::with_capacity(parallel_num);
-                for t in 0..parallel_num {
-                    let range = t * batch_range.len() / parallel_num..(t + 1) * batch_range.len() / parallel_num;
-                    threads.push(scope.spawn(|_| {
-                        let mut input = InputBox::new([input_size]);
-                        let mid = layer1.apply_to(input.clone(), ReLU::new());
-                        let mut output = layer2.apply_to(mid, SoftmaxWithLoss::new());
-                        let mut sum_of_loss = 0f64;
-                        let mut accuracy = 0f64;
-                        for i in range {
-                            let TrainDataPair {
-                                input: input_value,
-                                output: output_value,
-                            } = &data_pair[i];
-                            input.set_value(input_value.clone().into());
-                            output.set_expect_output(output_value.clone());
-                            let output_loss = output.get_output_value();
-                            let output_without_loss = output.get_output_without_loss();
-                            accuracy += match &output_without_loss {
-                                TensorEitherOwned::Dense(_) => unreachable!(),
-                                TensorEitherOwned::Sparse(tensor) => {
-                                    assert_eq!(output_value.value_count(), 1);
-                                    let ([correct_index], _) = output_value.iter().next().unwrap();
-                                    let correct = *tensor.get([correct_index]).unwrap();
-                                    if tensor.iter().all(|([i], v)| i == correct_index || *v < correct) {
-                                        1.
-                                    } else {
-                                        0.
-                                    }
-                                }
-                            };
-                            sum_of_loss += *output_loss.get([]).unwrap() as f64;
-                            output.clear_gradient_all();
-                            output.back_propagate_all();
-                        }
-                        (sum_of_loss, accuracy)
-                    }));
-                }
-                threads.into_iter().fold((0f64, 0f64), |(sum_loss, sum_accuracy), handle| {
-                    let (loss, accuracy) = handle.join().unwrap();
-                    (sum_loss + loss, sum_accuracy + accuracy)
-                })
-            })
-            .expect("failed to use thread");
+            let batch_range = i * MINI_BATCH_SIZE..((i + 1) * MINI_BATCH_SIZE).min(data_pair_train.len());
+            let (sum_of_loss, sum_of_accuracy) = process_mini_batch(&data_pair_train[batch_range.clone()], parallel_num, true, || {
+                let input = InputBox::new([input_size]);
+                let mid = layer1.apply_to(input.clone(), ReLU::new());
+                let output = layer2.apply_to(mid, SoftmaxWithLoss::new());
+                (input, output)
+            });
             println!(
                 "train_log,{},{},{},{}",
                 e * mini_batch_count + i,
                 time.elapsed().as_millis(),
-                sum_of_accuracy / data_pair.len() as f64,
-                sum_of_loss
+                sum_of_accuracy / batch_range.len() as f64,
+                sum_of_loss / batch_range.len() as f64,
             );
             layer1.update_parameter();
             layer2.update_parameter();
@@ -130,53 +92,81 @@ fn train(train_data: TrainData) {
                 next_rebuild += rebuild_delta;
             }
         }
-        let sum_of_accuracy = crossbeam::scope(|scope| {
-            let mut threads = Vec::with_capacity(parallel_num);
-            for t in 0..parallel_num {
-                let range = t * data_pair_test.len() / parallel_num..(t + 1) * data_pair_test.len() / parallel_num;
-                threads.push(scope.spawn(|_| {
-                    let mut input = InputBox::new([input_size]);
-                    let mid = layer1.apply_to(input.clone(), ReLU::new());
-                    let mut output = layer2.apply_unhash_to(mid, SoftmaxWithLoss::new());
-                    output.set_expect_output(Sparse::new([output_size]));
-                    let mut accuracy = 0f64;
-                    for i in range {
-                        let TrainDataPair {
-                            input: input_value,
-                            output: output_value,
-                        } = &data_pair_test[i];
-                        input.set_value(input_value.clone().into());
-                        let output_without_loss = output.get_output_without_loss();
-                        accuracy += match &output_without_loss {
-                            TensorEitherOwned::Dense(tensor) => {
-                                assert_eq!(output_value.value_count(), 1);
-                                let ([correct_index], _) = output_value.iter().next().unwrap();
-                                let correct = *tensor.get([correct_index]).unwrap();
-                                if tensor.as_all_slice().iter().enumerate().all(|(i, v)| i == correct_index || *v < correct) {
-                                    1.
-                                } else {
-                                    0.
-                                }
-                            }
-                            TensorEitherOwned::Sparse(_) => unreachable!(),
-                        };
-                    }
-                    accuracy
-                }));
-            }
-            threads.into_iter().fold(0f64, |sum_accuracy, handle| {
-                let accuracy = handle.join().unwrap();
-                sum_accuracy + accuracy
-            })
-        })
-        .expect("failed to use thread");
+        let (sum_of_loss, sum_of_accuracy) = process_mini_batch(data_pair_test, parallel_num, false, || {
+            let input = InputBox::new([input_size]);
+            let mid = layer1.apply_to(input.clone(), ReLU::new());
+            let output = layer2.apply_unhash_to(mid, SoftmaxWithLoss::new());
+            (input, output)
+        });
         println!(
-            "test_log,{},{},{},_",
+            "test_log,{},{},{},{}",
             (e + 1) * mini_batch_count,
             time.elapsed().as_millis(),
-            sum_of_accuracy / data_pair_test.len() as f64
+            sum_of_accuracy / data_pair_test.len() as f64,
+            sum_of_loss / data_pair_test.len() as f64,
         );
     }
+}
+
+fn process_mini_batch<I: 'static + ExactDimensionComputeGraphNode<1, Item = f32>, H: FullyConnectedHasher<f32, f32>>(
+    data_pair: &[TrainDataPair],
+    parallel_num: usize,
+    back_propagate: bool,
+    construct_layers: impl Sync + Fn() -> (GraphNode<InputBox<f32, 1>, 1>, GraphNode<ApplyFullyConnectedLayer<I, f32, H, SoftmaxWithLoss<f32>, 0>, 0>),
+) -> (f64, f64) {
+    crossbeam::scope(|scope| {
+        let mut threads = Vec::with_capacity(parallel_num);
+        for t in 0..parallel_num {
+            let range = t * data_pair.len() / parallel_num..(t + 1) * data_pair.len() / parallel_num;
+            threads.push(scope.spawn(|_| {
+                let (mut input, mut output) = construct_layers();
+                let mut sum_of_loss = 0f64;
+                let mut accuracy = 0f64;
+                for data in &data_pair[range] {
+                    let TrainDataPair {
+                        input: input_value,
+                        output: output_value,
+                    } = &data;
+                    assert_eq!(output_value.value_count(), 1);
+                    input.set_value(input_value.clone().into());
+                    output.set_expect_output(output_value.clone());
+                    let output_loss = output.get_output_value();
+                    let output_without_loss = output.get_output_without_loss();
+                    accuracy += match &output_without_loss {
+                        TensorEitherOwned::Dense(tensor) => {
+                            let ([correct_index], _) = output_value.iter().next().unwrap();
+                            let correct = *tensor.get([correct_index]).unwrap();
+                            if tensor.as_all_slice().iter().enumerate().all(|(i, v)| i == correct_index || *v < correct) {
+                                1.
+                            } else {
+                                0.
+                            }
+                        }
+                        TensorEitherOwned::Sparse(tensor) => {
+                            let ([correct_index], _) = output_value.iter().next().unwrap();
+                            let correct = *tensor.get([correct_index]).unwrap();
+                            if tensor.iter().all(|([i], v)| i == correct_index || *v < correct) {
+                                1.
+                            } else {
+                                0.
+                            }
+                        }
+                    };
+                    sum_of_loss += *output_loss.get([]).unwrap() as f64;
+                    if back_propagate {
+                        output.clear_gradient_all();
+                        output.back_propagate_all();
+                    }
+                }
+                (sum_of_loss, accuracy)
+            }));
+        }
+        threads.into_iter().fold((0f64, 0f64), |(sum_loss, sum_accuracy), handle| {
+            let (loss, accuracy) = handle.join().unwrap();
+            (sum_loss + loss, sum_accuracy + accuracy)
+        })
+    })
+    .expect("failed to use thread")
 }
 
 struct TrainData {
